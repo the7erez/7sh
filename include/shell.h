@@ -11,28 +11,23 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <termios.h>
-#include <linux/limits.h>
 
 #define HIST_SIZE 100
-#define MAX_ALIASES 50
 
-typedef struct {
-    char *name;
-    char *value;
-} Alias;
-
-extern Alias aliases[MAX_ALIASES];
-extern int alias_count;
+/* Global runtime variables declarations */
 extern char *history[HIST_SIZE];
 extern int hist_count;
+extern pid_t background_jobs[100];
+extern int job_count;
 
-char **split_line(char *line);
+/* Signal and core processing prototypes */
+void handle_sigint(int sig);
 int route_command(char **args);
+
+/* History management persistent prototypes */
+void load_history(void);
 void add_to_history(const char *cmd);
 void print_history(void);
 void free_history(void);
-void load_default_aliases(void);
-void load_config_file(void);
-char *read_line_with_autocomplete(void);
 
 #endif
