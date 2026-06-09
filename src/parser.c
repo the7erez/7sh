@@ -77,7 +77,7 @@ char* resolve_alias(const char *key) {
 char **split_line(char *line) {
     /* Dynamic check for alias definitions safely */
     if (strchr(line, '=') != NULL) {
-        char *line_copy = strdup(line); // تخصيص ديناميكي آمن تماماً وحجمه مرن
+        char *line_copy = strdup(line); 
         char *key = strtok(line_copy, "=");
         char *value = strtok(NULL, "");
         
@@ -158,7 +158,6 @@ char **split_line(char *line) {
             }
         }
 
-        /* Safe buffer calculation based on dynamically computed size constraints */
         size_t needed_space = strlen(token) + 256; 
         if (needed_space < 500) needed_space = 500;
 
@@ -186,7 +185,7 @@ char **split_line(char *line) {
             }
         }
 
-        tokens[position++] = expanded; // إسناد المؤشر المخصص ديناميكياً مباشرة بدون حد ثابت للـ Copy
+        tokens[position++] = expanded; 
         
         if (position >= bufsize) {
             bufsize += 64;

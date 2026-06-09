@@ -114,16 +114,12 @@ static int launch_proc(char **args) {
     if (pid == 0) { 
         /* Child Process Execution Context */
         if (background) {
-            /* Detach from the controlling terminal session so it won't die when terminal closes */
-            setsid();
-            
-            /* Immunize child from primary SIGINT (Ctrl+C) sent to terminal */
-            setpgid(0, 0);
-            
-            /* Ignore SIGHUP so the process keeps running if the terminal window is killed */
-            signal(SIGHUP, SIG_IGN);
-            
-            /* NO SILENCING HERE: Standard streams (stdout/stderr) remain open so you can see logs */
+            /* * Immunize background children from Ctrl+C (SIGINT) and Ctrl+Z (SIGTSTP).
+             * SIGHUP is NOT ignored, and setsid() is omitted, keeping the job linked 
+             * to the terminal group so it terminates naturally when Kitty closes.
+             */
+            signal(SIGINT, SIG_IGN);
+            signal(SIGTSTP, SIG_IGN);
         }
 
         for (int j = 0; args[j] != NULL; j++) {

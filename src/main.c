@@ -9,17 +9,38 @@
 #include <dirent.h>
 #include <termios.h>
 #include <sys/wait.h>
-#include <strings.h> /* Required for case-insensitive strcasecmp */
+#include <strings.h>
+
+/* External environment variable array provided by the system */
+extern char **environ;
 
 /* Forward Declarations to fix implicit declaration errors */
 int execute_single_command(char **args);
 int parse_and_execute_line(char *line);
 
+/* Global terminal tracking variables to rescue terminal state during SIGINT (Ctrl+C) */
+static struct termios orig_termios;
+static char *global_buf = NULL;
+static int *global_len = NULL;
+static int *global_pos = NULL;
+
 /**
- * Signal handler for SIGINT (Ctrl+C) to keep prompt line stable
+ * Signal handler for SIGINT (Ctrl+C).
+ * Resets the buffer, position, and restores Cooked Mode to prevent residual autocomplete artifacts.
  */
 void handle_sigint(int sig) {
-    (void)sig; 
+    (void)sig;
+    
+    /* Flush and reset the active input line buffer state safely */
+    if (global_buf && global_len && global_pos) {
+        memset(global_buf, 0, 1024);
+        *global_len = 0;
+        *global_pos = 0;
+    }
+    
+    /* Force restore terminal configuration back to baseline Cooked Mode immediately */
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    
     printf("\n\x1b[36m❯\x1b[0m ");
     fflush(stdout);
 }
@@ -82,11 +103,7 @@ void initialize_config_file(const char *path) {
     if (file) {
         fprintf(file, "# vim: set ft=sh :\n\n");
         fprintf(file, "# --- 7sh System Runcom Configuration ---\n\n");
-        
-        fprintf(file, "# Custom core prompt variable layout\n");
         fprintf(file, "export PS1=\"\\x1b[32m7erez@arch\\x1b[0m:\\x1b[34m\\w\\x1b[0m❯ \"\n\n");
-        
-        fprintf(file, "# Modern CLI Tools Substitutions\n");
         fprintf(file, "if command -v eza >/dev/null 2>&1; then\n");
         fprintf(file, "    alias ls=\"eza --icons --color=always\"\n");
         fprintf(file, "    alias ll=\"eza -l --icons --git\"\n");
@@ -96,16 +113,6 @@ void initialize_config_file(const char *path) {
         fprintf(file, "    alias ll=\"ls -l --color=auto\"\n");
         fprintf(file, "    alias la=\"ls -A --color=auto\"\n");
         fprintf(file, "fi\n\n");
-
-        fprintf(file, "if command -v bat >/dev/null 2>&1; then\n");
-        fprintf(file, "    alias cat=\"bat\"\n");
-        fprintf(file, "fi\n\n");
-        
-        fprintf(file, "# Core Utilities\n");
-        fprintf(file, "alias i=\"yay -S\"\n");
-        fprintf(file, "alias rmrf=\"rm -rf\"\n");
-        fprintf(file, "alias grep=\"grep --color=auto\"\n");
-        
         fclose(file);
     }
 }
@@ -119,12 +126,11 @@ int execute_single_command(char **args) {
     int i = 0;
     while (args[i] != NULL) i++;
     
-    /* Strict Cleanup: Strip trailing background character to prevent external binary confusion */
     if (i > 0 && strcmp(args[i - 1], "&") == 0) {
         args[i - 1] = NULL; 
     }
 
-    return route_command(args);
+    return route_command(args); 
 }
 
 /**
@@ -133,12 +139,11 @@ int execute_single_command(char **args) {
 int parse_and_execute_line(char *line) {
     if (line == NULL || strlen(line) == 0) return 1;
 
-    /* Clean inline comments safely before doing token scans */
     char *comment = strchr(line, '#');
     if (comment) *comment = '\0';
 
     char *commands[64];
-    int bg_flags[64] = {0}; /* 1 = Asynchronous Background Job, 0 = Standard Foreground */
+    int bg_flags[64] = {0};
     int cmd_count = 0;
 
     char *ptr = line;
@@ -156,7 +161,7 @@ int parse_and_execute_line(char *line) {
             cmd_count++;
         } else if (*ptr == '&') {
             *ptr = '\0'; ptr += 1;
-            bg_flags[cmd_count - 1] = 1; /* Mark previous pipeline slice as background target */
+            bg_flags[cmd_count - 1] = 1;
             commands[cmd_count] = ptr;
             cmd_count++;
         } else if (*ptr == ';') {
@@ -168,25 +173,15 @@ int parse_and_execute_line(char *line) {
         }
     }
 
-    int last_status = 0; 
     for (int i = 0; i < cmd_count; i++) {
         char *cmd_trim = commands[i];
         while (*cmd_trim == ' ' || *cmd_trim == '\t') cmd_trim++;
 
         if (strlen(cmd_trim) == 0) continue;
 
-        /* SAFETY CHECK: If the command is just "disown" and the previous one was a background job, 
-           we handle it safely to bypass race conditions */
-        if (strcmp(cmd_trim, "disown") == 0 && i > 0 && bg_flags[i-1] == 1) {
-            char *disown_args[] = {"disown", NULL};
-            route_command(disown_args);
-            continue; 
-        }
-
         char **args = split_line(cmd_trim);
         if (args && args[0] != NULL) {
             
-            /* If the parser explicitly tagged this command block for background isolation */
             if (bg_flags[i] == 1) {
                 int argc = 0;
                 while (args[argc] != NULL) argc++;
@@ -195,49 +190,57 @@ int parse_and_execute_line(char *line) {
                 args[argc + 1] = NULL;
             }
 
-            last_status = execute_single_command(args);
+            execute_single_command(args);
             free(args);
-            
-            /* Give the kernel parent context 50ms to register the PID securely before processing next commands */
+
             if (bg_flags[i] == 1) {
                 usleep(50000);
             }
         }
     }
 
-    (void)last_status;
     return 1;
 }
 
 /**
- * Processes runtime runcom profiles to structure working environments
+ * Custom environment/profile loader tailored for both interactive and login shells.
+ * Uses the built-in 'source' mechanism to load files directly inside the main process.
  */
-void load_config_file(void) {
+void load_config_file(int is_login) {
     char config_path[1024];
     char *home = getenv("HOME");
     if (!home) return;
     
+    /* 1. If flagged as login shell, execute the profile config in-process */
+    if (is_login) {
+        snprintf(config_path, sizeof(config_path), "%s/.7sh_profile", home);
+        if (access(config_path, F_OK) == 0) {
+            char **args = malloc(3 * sizeof(char*));
+            args[0] = strdup("source");
+            args[1] = strdup(config_path);
+            args[2] = NULL;
+            route_command(args);
+            free(args[0]); free(args[1]); free(args);
+        }
+    }
+
+    /* 2. Load the standard interactive runtime config (.7shrc) in-process */
     snprintf(config_path, sizeof(config_path), "%s/.7shrc", home);
     initialize_config_file(config_path);
 
-    FILE *file = fopen(config_path, "r");
-    if (!file) return; 
-
-    char line[1024];
-    while (fgets(line, sizeof(line), file)) {
-        line[strcspn(line, "\n")] = '\0'; 
-        if (strlen(line) == 0 || line[0] == '#') continue; 
-
-        parse_and_execute_line(line);
-    }
-    fclose(file);
+    char **args = malloc(3 * sizeof(char*));
+    args[0] = strdup("source");
+    args[1] = strdup(config_path);
+    args[2] = NULL;
+    route_command(args);
+    free(args[0]); free(args[1]); free(args);
 }
 
 /**
- * Custom line-noise/interactive input processing system with autocomplete
+ * Autocomplete and line editing utility operating over temporary raw termios configs
  */
 char *read_line_with_autocomplete(void) {
-    struct termios oldt, newt;
+    struct termios newt;
     char *buf = malloc(1024 * sizeof(char));
     int pos = 0;      
     int len = 0;      
@@ -250,9 +253,17 @@ char *read_line_with_autocomplete(void) {
     if (!buf) { perror("shell: allocation error"); exit(EXIT_FAILURE); }
     memset(buf, 0, 1024);
 
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
+    /* Bind tracking pointers to global variables for runtime clearing under SIGINT context */
+    global_buf = buf;
+    global_len = &len;
+    global_pos = &pos;
+
+    /* Cache current terminal context parameters safely */
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    newt = orig_termios;
     newt.c_lflag &= ~(ICANON | ECHO);
+    
+    /* Engage operational raw key tracking constraints */
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
     refresh_line(prompt_str, buf, pos);
@@ -385,9 +396,7 @@ char *read_line_with_autocomplete(void) {
             buf[pos] = '\0';
             char *last_space = strrchr(buf, ' ');
             char *full_word = last_space ? last_space + 1 : buf;
-            
             int is_command_mode = (last_space == NULL); 
-            
             char *matches[512]; 
             int is_directory[512] = {0};
             int match_count = 0;
@@ -467,7 +476,6 @@ char *read_line_with_autocomplete(void) {
                 }
             }
 
-            /* Case-insensitive sorting for matching items */
             if (match_count > 1) {
                 for (int i = 0; i < match_count - 1; i++) {
                     for (int j = i + 1; j < match_count; j++) {
@@ -482,16 +490,11 @@ char *read_line_with_autocomplete(void) {
             if (match_count == 1) {
                 char *completion = matches[0] + search_len;
                 while (*completion) { buf[pos++] = *completion; len++; completion++; }
-                
-                if (is_command_mode) {
-                    buf[pos++] = ' '; len++; 
-                } else if (is_directory[0]) {
-                    buf[pos++] = '/'; len++; 
-                }
+                if (is_command_mode) { buf[pos++] = ' '; len++; } 
+                else if (is_directory[0]) { buf[pos++] = '/'; len++; }
                 free(matches[0]);
                 refresh_line(prompt_str, buf, pos);
             }
-            /* Multiple matches handling with structured column padding */
             else if (match_count > 1) {
                 int l = 0;
                 while (1) {
@@ -507,35 +510,26 @@ char *read_line_with_autocomplete(void) {
                 
                 if (l == 0) {
                     printf("\n");
-                    
-                    /* Calculate the maximum filename length to determine dynamic column width */
                     int max_width = 0;
                     for (int i = 0; i < match_count; i++) {
                         int len = strlen(matches[i]);
                         if (len > max_width) max_width = len;
                     }
-                    max_width += 3; /* Add padding spacing between columns */
-
-                    /* Set standard terminal viewport boundaries and calculate available columns */
+                    max_width += 3;
                     int term_width = 80; 
                     int cols = term_width / max_width;
                     if (cols <= 0) cols = 1;
 
                     for (int i = 0; i < match_count; i++) {
                         if (is_command_mode) {
-                            /* Render commands in bold green with fixed-width spacing */
                             printf("\x1b[1;32m%-*s\x1b[0m", max_width, matches[i]); 
                         } else if (is_directory[i]) {
-                            /* Append directory slash inside the buffer to keep tabular alignment perfect */
                             char dir_buf[256];
                             snprintf(dir_buf, sizeof(dir_buf), "%s/", matches[i]);
                             printf("\x1b[1;34m%-*s\x1b[0m", max_width, dir_buf);
                         } else {
-                            /* Render regular files with fixed-width spacing */
                             printf("%-*s", max_width, matches[i]); 
                         }
-                        
-                        /* Wrap to a new line based on calculated grid density dynamically */
                         if ((i + 1) % cols == 0) printf("\n");
                     }
                     if (match_count % cols != 0) printf("\n");
@@ -553,18 +547,40 @@ char *read_line_with_autocomplete(void) {
             }
         }
     }
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    
+    /* Safely restore original baseline settings before dropping context back */
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
     return buf;
 }
 
 /**
- * Application context main entry point
+ * Application context main entry point with argument vector parsing capabilities
  */
-int main(void) {
-    char *line; int status = 1;
-    signal(SIGINT, handle_sigint);
+int main(int argc, char **argv) {
+    char *line; 
+    int status = 1;
+    int is_login_shell = 0;
+
+    /* Parse login and initialization flags provided by terminal environment loops */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--login") == 0) {
+            is_login_shell = 1;
+        }
+    }
+
+    if (is_login_shell || (argv[0] && argv[0][0] == '-')) {
+        is_login_shell = 1;
+        setenv("SHLVL", "1", 1);
+    }
     
-    load_config_file();
+    /* Hook baseline platform system processing signals securely */
+    signal(SIGINT, handle_sigint);
+    signal(SIGTSTP, SIG_IGN);  
+    signal(SIGQUIT, SIG_IGN);  
+    signal(SIGTTIN, SIG_IGN);  
+    signal(SIGTTOU, SIG_IGN);  
+    
+    load_config_file(is_login_shell);
     load_history();
 
     while (status) {
@@ -574,19 +590,27 @@ int main(void) {
             testing_buf[strcspn(testing_buf, "\n")] = '\0';
             if (strlen(testing_buf) == 0) continue;
 
+            if (strcmp(testing_buf, "exit") == 0) {
+                break;
+            }
+
             status = parse_and_execute_line(testing_buf);
         } 
         else {
             line = read_line_with_autocomplete();
             if (strlen(line) == 0) { free(line); continue; }
 
+            if (strcmp(line, "exit") == 0) {
+                free(line);
+                break; 
+            }
+
             add_to_history(line);
-
             status = parse_and_execute_line(line);
-
             free(line); 
         }
     }
+    
     free_history();
     return EXIT_SUCCESS;
 }
